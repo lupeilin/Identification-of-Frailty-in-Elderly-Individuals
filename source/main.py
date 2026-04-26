@@ -169,6 +169,10 @@ if __name__ == "__main__":
     print("老年衰弱自动识别系统 - 演示流程")
     print("=" * 60)
 
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU device: {torch.cuda.get_device_name(0)}")
+
     # Step 1: 生成假数据
     df = generate_fake_data()
 
@@ -178,7 +182,14 @@ if __name__ == "__main__":
     # Step 3: 测试BERT推理
     print("\n🔍 BERT推理测试：")
     test_text = "患者女性，28岁，体重无明显变化，自感疲乏无力，步态平稳。"
+
+    # 获取模型所在设备
+    device = next(model.parameters()).device
+
+    # 将输入张量移到同一设备
     inputs = tokenizer(test_text, return_tensors="pt", truncation=True, max_length=128)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
     with torch.no_grad():
         outputs = model(**inputs)
         pred = outputs.logits.argmax(-1).item()
