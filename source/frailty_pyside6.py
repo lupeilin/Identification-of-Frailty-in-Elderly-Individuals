@@ -5,10 +5,13 @@ import requests
 import torch
 from transformers import BertTokenizer, BertForSequenceClassification
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QTextEdit, QPushButton, QStatusBar
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QMessageBox,
+    QTextEdit, QPushButton, QStatusBar, QFileDialog, QTabWidget  # 添加 QFileDialog
+)
 from PySide6.QtCore import QThread, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QAction
 
 # ================= 1. 模型加载函数（不依赖 QApplication）=================
 MODEL_PATH = "./frailty_bert_demo_model"
@@ -202,22 +205,18 @@ class OllamaHealthCheckThread(QThread):
 
 
 # ================= 5. 主窗口 =================
+
 class FrailtyMainWindow(QMainWindow):
     def __init__(self, tokenizer, model, device):
         super().__init__()
         print("初始化主窗口...")
         self.tokenizer = tokenizer
-        self.setWindowTitle("老年衰弱智能评估系统")
-        self.setGeometry(100, 100, 800, 650)
-
         self.model = model
         self.device = device
 
-        # 加载 UI 文件
-        ui_file = os.path.join(os.path.dirname(__file__), "tools/frailty_ui.ui")
-        print(f"UI 文件路径：{ui_file}")
+        # 加载新版 UI 文件
+        ui_file = os.path.join(os.path.dirname(__file__), "tools/frailty_ui_v2.ui")
         if not os.path.exists(ui_file):
-            print(f"错误：UI 文件不存在 {ui_file}")
             QMessageBox.critical(self, "UI 文件缺失", f"未找到界面文件：{ui_file}")
             sys.exit(1)
 
@@ -225,42 +224,59 @@ class FrailtyMainWindow(QMainWindow):
         try:
             self.ui = loader.load(ui_file, None)
             if self.ui is None:
-                raise RuntimeError("QUiLoader 返回 None，请检查 UI 文件内容是否正确")
+                raise RuntimeError("QUiLoader 返回 None")
         except Exception as e:
-            print(f"加载 UI 文件异常：{str(e)}")
             QMessageBox.critical(self, "UI 加载失败", f"无法加载 UI 文件：{str(e)}")
             sys.exit(1)
 
         self.setCentralWidget(self.ui)
-        print("UI 加载成功")
 
-        # 获取控件引用
+        # ----- 核心控件 -----
         self.text_input = self.ui.findChild(QTextEdit, "text_input")
+        self.result_tabs = self.ui.findChild(QTabWidget, "result_tabs")
         self.result_display = self.ui.findChild(QTextEdit, "result_display")
-        self.btn_quick_predict = self.ui.findChild(QPushButton, "btn_quick_predict")
-        self.btn_explain_predict = self.ui.findChild(QPushButton, "btn_explain_predict")
-        self.btn_clear = self.ui.findChild(QPushButton, "btn_clear")
+        self.explain_display = self.ui.findChild(QTextEdit, "explain_display")
+
+        # 输入区按钮（仅两个）
         self.btn_example = self.ui.findChild(QPushButton, "btn_example")
+        self.btn_clear = self.ui.findChild(QPushButton, "btn_clear")
 
-        # 检查关键控件
-        if not self.text_input:
-            print("警告：未找到 text_input 控件")
-        if not self.result_display:
-            print("警告：未找到 result_display 控件")
-        if not self.btn_quick_predict:
-            print("警告：未找到 btn_quick_predict 控件")
-        if not self.btn_explain_predict:
-            print("警告：未找到 btn_explain_predict 控件")
+        # 菜单/工具栏动作
+        self.action_load_case = self.ui.findChild(QAction, "action_load_case")
+        self.action_batch_import = self.ui.findChild(QAction, "action_batch_import")
+        self.action_exit = self.ui.findChild(QAction, "action_exit")
+        self.action_model_info = self.ui.findChild(QAction, "action_model_info")
+        self.action_ollama_status = self.ui.findChild(QAction, "action_ollama_status")
+        self.action_settings = self.ui.findChild(QAction, "action_settings")
+        self.action_about = self.ui.findChild(QAction, "action_about")
+        self.action_usage_guide = self.ui.findChild(QAction, "action_usage_guide")
+        self.action_quick_predict = self.ui.findChild(QAction, "action_quick_predict")
+        self.action_explain_predict = self.ui.findChild(QAction, "action_explain_predict")
+        self.action_clear = self.ui.findChild(QAction, "action_clear")
 
-        # 状态栏直接获取
         self.status_bar = self.statusBar()
-        self.status_bar.showMessage("正在初始化...")
+        self.status_bar.showMessage("系统就绪")
 
-        # 连接信号槽
-        self.btn_quick_predict.clicked.connect(self.on_quick_predict)
-        self.btn_explain_predict.clicked.connect(self.on_explain_predict)
-        self.btn_clear.clicked.connect(lambda: self.text_input.clear())
+        # ----- 信号槽连接 -----
+        # 按钮
         self.btn_example.clicked.connect(self.fill_example)
+        self.btn_clear.clicked.connect(lambda: self.text_input.clear())
+        # 菜单/工具栏动作
+        self.action_quick_predict.triggered.connect(self.on_quick_predict)
+        self.action_explain_predict.triggered.connect(self.on_explain_predict)
+        self.action_clear.triggered.connect(lambda: self.text_input.clear())
+        self.action_load_case.triggered.connect(self.load_case_from_file)
+        self.action_exit.triggered.connect(self.close)
+
+        # 占位功能
+        def placeholder(title):
+            QMessageBox.information(self, title, "该功能将在后续版本中提供。")
+        self.action_batch_import.triggered.connect(lambda: placeholder("批量导入"))
+        self.action_model_info.triggered.connect(lambda: placeholder("模型信息"))
+        self.action_ollama_status.triggered.connect(lambda: placeholder("Ollama 状态"))
+        self.action_settings.triggered.connect(lambda: placeholder("系统设置"))
+        self.action_about.triggered.connect(lambda: placeholder("关于软件"))
+        self.action_usage_guide.triggered.connect(lambda: placeholder("使用指南"))
 
         # 启动 Ollama 健康检查
         self.ollama_check_thread = OllamaHealthCheckThread()
@@ -273,13 +289,12 @@ class FrailtyMainWindow(QMainWindow):
     @Slot(bool, str)
     def on_ollama_status(self, is_available, message):
         self.status_bar.showMessage(message, 5000)
+        self.action_explain_predict.setEnabled(is_available)
         if not is_available:
-            self.btn_explain_predict.setEnabled(False)
-            self.btn_explain_predict.setToolTip(message)
+            self.action_explain_predict.setToolTip(message)
             QMessageBox.warning(self, "服务不可用", message + "\n详细解释功能将被禁用。")
         else:
-            self.btn_explain_predict.setEnabled(True)
-            self.btn_explain_predict.setToolTip("")
+            self.action_explain_predict.setToolTip("")
 
     @Slot()
     def on_quick_predict(self):
@@ -287,11 +302,12 @@ class FrailtyMainWindow(QMainWindow):
         if not text:
             QMessageBox.warning(self, "提示", "请输入病历文本！")
             return
-
         self.status_bar.showMessage("正在进行快速预测...")
         result = predict_frailty(text, self.tokenizer, self.model, self.device)
         output = f"预测结论：{result['prediction']}\n置信度：{result['confidence']:.4f}"
         self.result_display.setPlainText(output)
+        if self.result_tabs is not None:
+            self.result_tabs.setCurrentIndex(0)
         self.status_bar.showMessage("预测完成", 3000)
 
     @Slot()
@@ -300,33 +316,47 @@ class FrailtyMainWindow(QMainWindow):
         if not text:
             QMessageBox.warning(self, "提示", "请输入病历文本！")
             return
-
         bert_result = predict_frailty(text, self.tokenizer, self.model, self.device)
         if bert_result["prediction"] == "未知":
             QMessageBox.warning(self, "提示", "病历文本无效，无法生成详细解释。")
             return
-
-        pred = bert_result["prediction"]
-        conf = bert_result["confidence"]
-
+        pred, conf = bert_result["prediction"], bert_result["confidence"]
         if self.explain_thread is not None and self.explain_thread.isRunning():
             QMessageBox.information(self, "提示", "已有分析任务进行中，请稍后再试。")
             return
 
-        self.btn_explain_predict.setEnabled(False)
+        self.action_explain_predict.setEnabled(False)
         self.status_bar.showMessage("正在调用本地大模型进行详细分析，请稍候...")
-        self.result_display.setPlainText("等待大模型分析中...")
+        self.explain_display.setPlainText("等待大模型分析中...")
+        if self.result_tabs is not None:
+            self.result_tabs.setCurrentIndex(1)
 
         self.explain_thread = ExplanationThread(text, pred, conf)
         self.explain_thread.finished.connect(self.on_explanation_ready)
-        self.explain_thread.finished.connect(lambda: self.btn_explain_predict.setEnabled(True))
+        self.explain_thread.finished.connect(lambda: self.action_explain_predict.setEnabled(True))
         self.explain_thread.start()
 
     @Slot(dict)
     def on_explanation_ready(self, explanation_dict):
         html_content = format_explanation_html(explanation_dict)
-        self.result_display.setHtml(html_content)
+        self.explain_display.setHtml(html_content)
+        if self.result_tabs is not None:
+            self.result_tabs.setCurrentIndex(1)
         self.status_bar.showMessage("详细解释已生成", 5000)
+
+    @Slot()
+    def load_case_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择病历文件", "", "文本文件 (*.txt);;所有文件 (*)"
+        )
+        if file_path:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                self.text_input.setPlainText(content)
+                self.status_bar.showMessage(f"已加载：{os.path.basename(file_path)}", 3000)
+            except Exception as e:
+                QMessageBox.critical(self, "读取失败", f"无法读取文件：\n{str(e)}")
 
     def fill_example(self):
         example = """患者女性，78岁，退休教师。主诉：近1年体重下降8kg（原体重60kg），自觉"浑身没劲"，走路速度明显变慢，以前能轻松走完小区一圈，现在中途需要休息。家属反映患者近半年几乎不出门，日常家务也懒得做。既往史：高血压、骨关节炎。查体：步速0.6m/s，握力（右手）14kg（参考同龄女性正常值>18kg）。"""

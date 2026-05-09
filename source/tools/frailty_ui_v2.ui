@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1024</width>
+    <height>720</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>老年衰弱智能评估系统 v2.0</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">
+    QMainWindow {
+        background-color: #f5f7fa;
+    }
+    QMenuBar {
+        background-color: #2c3e50;
+        color: white;
+        border-bottom: 1px solid #1a252f;
+    }
+    QMenuBar::item:selected {
+        background-color: #34495e;
+    }
+    QMenu {
+        background-color: #2c3e50;
+        color: white;
+    }
+    QMenu::item:selected {
+        background-color: #3498db;
+    }
+    QToolBar {
+        background-color: #ecf0f1;
+        border-bottom: 1px solid #bdc3c7;
+        spacing: 5px;
+        padding: 3px;
+    }
+    QToolButton {
+        background-color: #3498db;
+        color: white;
+        border-radius: 4px;
+        padding: 5px 12px;
+        font-weight: bold;
+    }
+    QToolButton:hover {
+        background-color: #2980b9;
+    }
+    QToolButton:pressed {
+        background-color: #1c5980;
+    }
+    QStatusBar {
+        background-color: #ecf0f1;
+        border-top: 1px solid #bdc3c7;
+        color: #2c3e50;
+    }
+    QWidget#centralwidget {
+        background-color: #f5f7fa;
+    }
+    QLabel {
+        color: #2c3e50;
+    }
+    QLabel#title_label {
+        color: #2c3e50;
+        font-size: 18px;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+    QGroupBox {
+        border: 1px solid #bdc3c7;
+        border-radius: 6px;
+        margin-top: 14px;
+        font-weight: bold;
+        color: #2c3e50;
+        background-color: white;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 5px;
+        color: #2c3e50;
+    }
+    QTextEdit {
+        border: 1px solid #bdc3c7;
+        border-radius: 4px;
+        background-color: white;
+        color: #2c3e50;
+        selection-background-color: #3498db;
+    }
+    QPushButton {
+        border-radius: 4px;
+        padding: 6px 16px;
+        font-weight: bold;
+        color: white;
+    }
+    QPushButton#btn_clear {
+        background-color: #e74c3c;
+    }
+    QPushButton#btn_clear:hover {
+        background-color: #c0392b;
+    }
+    QPushButton#btn_example {
+        background-color: #3498db;
+    }
+    QPushButton#btn_example:hover {
+        background-color: #2980b9;
+    }
+    QTabWidget::pane {
+        border: 1px solid #bdc3c7;
+        background: white;
+        border-radius: 4px;
+    }
+    QTabBar::tab {
+        background: #ecf0f1;
+        border: 1px solid #bdc3c7;
+        padding: 6px 16px;
+        margin-right: 2px;
+        border-top-left-radius: 4px;
+        border-top-right-radius: 4px;
+        color: #2c3e50;
+    }
+    QTabBar::tab:selected {
+        background: white;
+        border-bottom-color: white;
+        color: #2c3e50;
+    }
+    QTabWidget QWidget {
+        color: #2c3e50;
+    }
+   </string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <property name="spacing">
+     <number>10</number>
+    </property>
+    <property name="leftMargin">
+     <number>20</number>
+    </property>
+    <property name="topMargin">
+     <number>10</number>
+    </property>
+    <property name="rightMargin">
+     <number>20</number>
+    </property>
+    <property name="bottomMargin">
+     <number>10</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="title_label">
+      <property name="text">
+       <string>老年衰弱自动识别系统</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="main_layout">
+      <item>
+       <widget class="QGroupBox" name="input_group">
+        <property name="title">
+         <string>病历输入</string>
+        </property>
+        <layout class="QVBoxLayout" name="input_layout">
+         <item>
+          <widget class="QTextEdit" name="text_input">
+           <property name="placeholderText">
+            <string>请在此处粘贴脱敏后的电子病历文本，或使用菜单/工具栏加载文件...</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <layout class="QHBoxLayout" name="button_layout">
+           <item>
+            <spacer name="horizontalSpacer">
+             <property name="orientation">
+              <enum>Qt::Horizontal</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>40</width>
+               <height>20</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btn_example">
+             <property name="text">
+              <string>填入示例</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btn_clear">
+             <property name="text">
+              <string>清空</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="horizontalSpacer_2">
+             <property name="orientation">
+              <enum>Qt::Horizontal</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>40</width>
+               <height>20</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+          </layout>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="output_group">
+        <property name="title">
+         <string>评估结果</string>
+        </property>
+        <layout class="QVBoxLayout" name="output_layout">
+         <item>
+          <widget class="QTabWidget" name="result_tabs">
+           <widget class="QWidget" name="tab_predict">
+            <attribute name="title">
+             <string>预测结论</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="predict_tab_layout">
+             <item>
+              <widget class="QTextEdit" name="result_display">
+               <property name="readOnly">
+                <bool>true</bool>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+           <widget class="QWidget" name="tab_explain">
+            <attribute name="title">
+             <string>详细分析</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="explain_tab_layout">
+             <item>
+              <widget class="QTextEdit" name="explain_display">
+               <property name="readOnly">
+                <bool>true</bool>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+  <widget class="QMenuBar" name="menubar">
+   <widget class="QMenu" name="menu_file">
+    <property name="title">
+     <string>文件(&amp;F)</string>
+    </property>
+    <addaction name="action_load_case"/>
+    <addaction name="action_batch_import"/>
+    <addaction name="separator"/>
+    <addaction name="action_exit"/>
+   </widget>
+   <widget class="QMenu" name="menu_tools">
+    <property name="title">
+     <string>工具(&amp;T)</string>
+    </property>
+    <addaction name="action_model_info"/>
+    <addaction name="action_ollama_status"/>
+    <addaction name="separator"/>
+    <addaction name="action_settings"/>
+   </widget>
+   <widget class="QMenu" name="menu_help">
+    <property name="title">
+     <string>帮助(&amp;H)</string>
+    </property>
+    <addaction name="action_about"/>
+    <addaction name="action_usage_guide"/>
+   </widget>
+   <addaction name="menu_file"/>
+   <addaction name="menu_tools"/>
+   <addaction name="menu_help"/>
+  </widget>
+  <widget class="QToolBar" name="toolbar">
+   <property name="windowTitle">
+    <string>工具栏</string>
+   </property>
+   <attribute name="toolBarArea">
+    <enum>TopToolBarArea</enum>
+   </attribute>
+   <attribute name="toolBarBreak">
+    <bool>false</bool>
+   </attribute>
+   <addaction name="action_quick_predict"/>
+   <addaction name="action_explain_predict"/>
+   <addaction name="separator"/>
+   <addaction name="action_clear"/>
+   <addaction name="action_load_case"/>
+   <addaction name="separator"/>
+   <addaction name="action_settings"/>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+  <action name="action_load_case">
+   <property name="text">
+    <string>加载病例...</string>
+   </property>
+   <property name="toolTip">
+    <string>打开本地病历文件</string>
+   </property>
+  </action>
+  <action name="action_batch_import">
+   <property name="text">
+    <string>批量导入...</string>
+   </property>
+   <property name="toolTip">
+    <string>从文件夹批量导入病历</string>
+   </property>
+  </action>
+  <action name="action_exit">
+   <property name="text">
+    <string>退出</string>
+   </property>
+  </action>
+  <action name="action_model_info">
+   <property name="text">
+    <string>模型信息</string>
+   </property>
+   <property name="toolTip">
+    <string>查看当前使用的BERT模型详情</string>
+   </property>
+  </action>
+  <action name="action_ollama_status">
+   <property name="text">
+    <string>Ollama 状态</string>
+   </property>
+   <property name="toolTip">
+    <string>检查本地大模型服务状态</string>
+   </property>
+  </action>
+  <action name="action_settings">
+   <property name="text">
+    <string>系统设置</string>
+   </property>
+   <property name="toolTip">
+    <string>配置API地址、模型路径等</string>
+   </property>
+  </action>
+  <action name="action_about">
+   <property name="text">
+    <string>关于软件</string>
+   </property>
+  </action>
+  <action name="action_usage_guide">
+   <property name="text">
+    <string>使用指南</string>
+   </property>
+  </action>
+  <action name="action_quick_predict">
+   <property name="text">
+    <string>快速预测</string>
+   </property>
+   <property name="toolTip">
+    <string>使用BERT模型进行快速衰弱评估</string>
+   </property>
+  </action>
+  <action name="action_explain_predict">
+   <property name="text">
+    <string>详细解释</string>
+   </property>
+   <property name="toolTip">
+    <string>结合大模型生成详细解释</string>
+   </property>
+  </action>
+  <action name="action_clear">
+   <property name="text">
+    <string>清空输入</string>
+   </property>
+   <property name="toolTip">
+    <string>清空当前病历文本</string>
+   </property>
+  </action>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

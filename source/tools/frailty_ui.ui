@@ -93,6 +93,16 @@
         </property>
        </widget>
       </item>
+      <item>
+       <widget class="QPushButton" name="btn_load_case">
+        <property name="text">
+         <string>加载病例</string>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">background-color: #9C27B0; color: white;</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </item>
     <item>
