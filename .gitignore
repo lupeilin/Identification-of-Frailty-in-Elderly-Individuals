@@ -4,3 +4,5 @@ frailty_bert_demo_model/
 .idea/
 .venv/
 source/__pycache__/
+geriatric_knowledge_db/
+models/
