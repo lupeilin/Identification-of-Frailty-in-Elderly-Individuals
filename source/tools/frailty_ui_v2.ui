@@ -256,6 +256,30 @@
                                                             </property>
                                                         </widget>
                                                     </item>
+                                                    <item>
+                                                        <layout class="QHBoxLayout" name="feedback_layout">
+                                                            <item>
+                                                                <spacer name="horizontalSpacer">
+                                                                    <property name="orientation">
+                                                                        <enum>Qt::Horizontal</enum>
+                                                                    </property>
+                                                                </spacer>
+                                                            </item>
+                                                            <item>
+                                                                <widget class="QPushButton" name="btn_feedback">
+                                                                    <property name="text">
+                                                                        <string>💡 提交反馈</string>
+                                                                    </property>
+                                                                    <property name="enabled">
+                                                                        <bool>false</bool>
+                                                                    </property>
+                                                                    <property name="toolTip">
+                                                                        <string>评估完成后可提交医生校正意见</string>
+                                                                    </property>
+                                                                </widget>
+                                                            </item>
+                                                        </layout>
+                                                    </item>
                                                 </layout>
                                             </widget>
                                             <widget class="QWidget" name="tab_patient_list">
@@ -342,6 +366,7 @@
                     <string>工具(&amp;T)</string>
                 </property>
                 <addaction name="action_export_excel"/>
+                <addaction name="action_batch_annotation" />
                 <addaction name="action_model_info" />
                 <addaction name="action_ollama_status" />
                 <addaction name="separator" />
@@ -391,6 +416,14 @@
             </property>
             <property name="toolTip">
                 <string>从文件夹批量导入病历</string>
+            </property>
+        </action>
+        <action name="action_batch_annotation">
+            <property name="text">
+                <string>批量标注与模型训练...</string>
+            </property>
+            <property name="toolTip">
+                <string>打开批量标注与模型训练面板</string>
             </property>
         </action>
         <action name="action_exit">

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 frailty_assessment_app.py
-老年衰弱智能评估系统（带知识库查询）
+老年衰弱智能评估系统（带知识库查询 + 反馈收集 + 全自动持续学习）
 用法：python frailty_assessment_app.py
 前提：已运行 build_knowledge_base.py 构建知识库
 """
@@ -11,12 +11,20 @@ import os
 import sys
 import json
 import requests
+import sqlite3
+import hashlib
 import torch
-from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset, DatasetDict
+from sklearn.model_selection import train_test_split
+from numpy import dot
+from numpy.linalg import norm
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QMessageBox, QProgressDialog, QTableWidgetItem, QHeaderView,
-    QTextEdit, QPushButton, QStatusBar, QFileDialog, QTabWidget, QTableWidget
+    QTextEdit, QPushButton, QStatusBar, QFileDialog, QTabWidget, QTableWidget, QDialog,
+    QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QDialogButtonBox, QTextEdit as QDialogTextEdit,
+    QWidget, QGroupBox, QFrame
 )
 from PySide6.QtCore import QThread, Signal, Slot, Qt, QDateTime
 from PySide6.QtUiTools import QUiLoader
@@ -27,24 +35,35 @@ from sentence_transformers import SentenceTransformer
 from huggingface_hub import snapshot_download
 import shutil
 
+from batch_annotation_tool import (
+    init_batch_annotation_db, import_batch_records, auto_annotate_with_llm,
+    get_records_for_review, submit_manual_label, analyze_annotation_quality,
+    export_annotated_data, full_retrain_bert, BATCH_ANNOTATION_DB
+)
+
+# ================= 路径常量（基于脚本所在目录） =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+DB_DIR = os.path.join(BASE_DIR, "geriatric_knowledge_db")
+BERT_MODEL_PATH = os.path.join(BASE_DIR, "frailty_bert_demo_model")
+UI_DIR = os.path.join(BASE_DIR, "tools")
+
 # ================= 本地知识库模块 =================
-chroma_client = chromadb.PersistentClient(path="./geriatric_knowledge_db")
+chroma_client = chromadb.PersistentClient(path=DB_DIR)
 collection = chroma_client.get_or_create_collection(name="geriatric_guidelines")
 
 
 def load_embedding_model():
     """
-    加载本地嵌入模型，优先使用中文医疗专用模型 Ganymede-Health-BERT，
+    加载本地嵌入模型，使用 BAAI/bge-large-zh-v1.5 中文嵌入模型，
     下载失败时自动回退到通用多语言模型。
     """
-    model_repo = "BAAI/bge-large-zh-v1.5"          # 中文医疗 BERT（主模型）
-    fallback_repo = "paraphrase-multilingual-MiniLM-L12-v2"   # 通用多语言备选
+    model_repo = "BAAI/bge-large-zh-v1.5"
+    fallback_repo = "paraphrase-multilingual-MiniLM-L12-v2"
 
-    # 模型存放目录（与 frailty_assessment_app.py 的 models 目录平行）
-    models_root = "models"       # 模型根目录
-    local_model_dir = models_root + "/BAAI/bge-large-zh-v1.5"
+    local_model_dir = os.path.join(MODELS_DIR, "BAAI", "bge-large-zh-v1.5")
+    fallback_dir = os.path.join(MODELS_DIR, "paraphrase-multilingual-MiniLM-L12-v2")
 
-    config_path = os.path.join(local_model_dir, "config.json")
     # 如果本地已存在，直接加载
     if os.path.exists(local_model_dir) and os.path.isdir(local_model_dir):
         print(f"✅ 从本地加载嵌入模型：{local_model_dir}")
@@ -60,7 +79,6 @@ def load_embedding_model():
     except Exception as e:
         print(f"❌ 下载 {model_repo} 失败：{e}")
         print("尝试回退到通用模型...")
-        fallback_dir = os.path.join(models_root, "paraphrase-multilingual-MiniLM-L12-v2")
         if not os.path.exists(fallback_dir):
             try:
                 fallback_model = SentenceTransformer(fallback_repo)
@@ -77,7 +95,7 @@ def load_embedding_model():
 embedding_model = load_embedding_model()
 
 
-def retrieve_relevant_guidelines(query, top_k=5, distance_threshold=0.5):
+def retrieve_relevant_guidelines(query, top_k=5, distance_threshold=0.3):
     """从知识库检索相关指南片段，支持余弦距离过滤并返回来源信息"""
     if collection.count() == 0:
         return []
@@ -104,28 +122,39 @@ def retrieve_relevant_guidelines(query, top_k=5, distance_threshold=0.5):
     documents = documents[:top_k]
     return documents
 
-# ================= BERT 模型加载与预测（保持不变） =================
-MODEL_PATH = "./frailty_bert_demo_model"
+# ================= BERT 模型加载与预测（支持热切换） =================
+MODEL_PATH = BERT_MODEL_PATH
 
-def load_bert_model():
-    if not os.path.exists(MODEL_PATH):
-        print(f"错误：未找到 BERT 模型目录 {MODEL_PATH}")
+def load_bert_model(model_path=None):
+    """加载 BERT 模型，支持传入自定义路径实现热切换"""
+    if model_path is None:
+        model_path = MODEL_PATH
+    if not os.path.exists(model_path):
+        print(f"错误：未找到 BERT 模型目录 {model_path}")
         sys.exit(1)
     try:
-        tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
-        model = BertForSequenceClassification.from_pretrained(MODEL_PATH)
+        tokenizer = BertTokenizer.from_pretrained(model_path)
+        model = BertForSequenceClassification.from_pretrained(model_path)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
         model.eval()
+        print(f"✅ BERT 模型加载完成：{model_path}")
         return tokenizer, model, device
     except Exception as e:
         print(f"BERT 模型加载失败：{str(e)}")
         sys.exit(1)
 
+def reload_bert_model(model_path):
+    """热切换 BERT 模型，不重启程序"""
+    global tokenizer, model, device
+    print(f"🔄 热切换 BERT 模型到：{model_path}")
+    tokenizer, model, device = load_bert_model(model_path)
+    return tokenizer, model, device
+
 def predict_frailty(text, tokenizer, model, device):
     if not text or not text.strip():
         return {"prediction": "未知", "confidence": 0.0}
-    inputs = tokenizer(text, padding="max_length", truncation=True, max_length=128, return_tensors="pt")
+    inputs = tokenizer(text, padding="max_length", truncation=True, max_length=256, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs)
@@ -172,23 +201,97 @@ def validate_fried_items(data):
     if "fried_items" not in data:
         return False
     for item in data["fried_items"]:
-        if item.get("name") not in EXPECTED_NAMES:
+        name = item.get("name", "").strip()
+        if name not in EXPECTED_NAMES:
             return False
     return True
 
 
-def generate_explanation(text, bert_pred, bert_conf):
+# Few-shot 示例，用于引导 LLM 正确输出格式和生成个性化临床建议
+FEW_SHOT_EXAMPLE = """
+【示例1：衰弱（5项阳性）】
+患者信息：患者男性，82岁，近1年体重下降8kg，自觉疲乏无力，握力下降（右手12kg），步速0.5m/s，近半年几乎不出门。
+
+正确输出：
+{
+  "fried_items": [
+    {"name": "不明原因体重下降", "result": "阳性", "evidence": "近1年体重下降8kg"},
+    {"name": "疲乏/精力减退", "result": "阳性", "evidence": "自觉疲乏无力"},
+    {"name": "握力下降", "result": "阳性", "evidence": "右手握力12kg（低于同龄男性正常值）"},
+    {"name": "步速减慢", "result": "阳性", "evidence": "步速0.5m/s（低于正常值0.65m/s）"},
+    {"name": "活动量减少", "result": "阳性", "evidence": "近半年几乎不出门"}
+  ],
+  "positive_count": 5,
+  "conclusion": "衰弱",
+  "suggestions": "【营养干预】患者存在明显体重下降，建议：①每日蛋白质摄入1.2-1.5g/kg（约60-75g），优选鸡蛋、牛奶、鱼肉；②口服营养补充剂（如安素）400-600kcal/日；③补充维生素D 800-1000IU/日 + 钙1000mg/日。\n【运动康复】患者握力下降、步速减慢、活动量少，建议：①渐进性抗阻训练（弹力带/轻哑铃），每周2-3次，每次8-12次/组，1-3组；②平衡训练（太极拳/单腿站立），每周≥3次，每次20-30分钟；③有氧运动（室内步行），从每天10分钟开始，逐步增至30分钟。\n【跌倒预防】患者步速减慢、活动量少，跌倒风险高：①居家安装扶手、防滑垫；②使用助行器辅助行走；③每3个月进行跌倒风险评估。\n【随访】每3个月复查体重、握力、步速，评估干预效果。建议转诊老年衰弱门诊，多学科团队（老年科、营养科、康复科）联合管理。"
+}
+
+【示例2：非衰弱（0项阳性）】
+患者信息：患者女性，70岁，退休教师，体检发现血压升高。无体重下降，精神好，握力正常，每天散步1小时，做家务。
+
+正确输出：
+{
+  "fried_items": [
+    {"name": "不明原因体重下降", "result": "阴性", "evidence": "无体重下降"},
+    {"name": "疲乏/精力减退", "result": "阴性", "evidence": "精神好"},
+    {"name": "握力下降", "result": "阴性", "evidence": "握力正常"},
+    {"name": "步速减慢", "result": "阴性", "evidence": "每天散步1小时"},
+    {"name": "活动量减少", "result": "阴性", "evidence": "做家务，活动量正常"}
+  ],
+  "positive_count": 0,
+  "conclusion": "非衰弱",
+  "suggestions": "【健康维持】患者目前无衰弱表现，建议：①继续保持规律运动（每周≥150分钟中等强度有氧运动）；②均衡饮食，蛋白质摄入≥1.0g/kg/日；③每年进行一次衰弱筛查（FRAIL量表或Fried表型）；④控制血压，定期监测。\n【预防建议】虽然当前非衰弱，但70岁以上老年人衰弱风险随年龄增加，建议：①维持社交活动，预防抑郁；②预防跌倒（居家安全检查）；③定期体检，早期发现慢性病。"
+}
+
+【示例3：衰弱前期（2项阳性）】
+患者信息：患者男性，75岁，近半年体重下降3kg（原体重70kg），自觉有些疲乏，但握力正常，步速正常，每天仍出门买菜。
+
+正确输出：
+{
+  "fried_items": [
+    {"name": "不明原因体重下降", "result": "阳性", "evidence": "近半年体重下降3kg（约4.3%，接近5%阈值）"},
+    {"name": "疲乏/精力减退", "result": "阳性", "evidence": "自觉有些疲乏"},
+    {"name": "握力下降", "result": "阴性", "evidence": "握力正常"},
+    {"name": "步速减慢", "result": "阴性", "evidence": "步速正常"},
+    {"name": "活动量减少", "result": "阴性", "evidence": "每天出门买菜"}
+  ],
+  "positive_count": 2,
+  "conclusion": "衰弱前期",
+  "suggestions": "【早期干预】患者处于衰弱前期，存在体重下降和疲乏，建议积极干预以逆转为健康状态：\n①营养干预：增加蛋白质摄入至1.2g/kg/日，每日补充鸡蛋1-2个、牛奶300ml；排查体重下降原因（食欲？吞咽？消化？）。\n②疲乏管理：评估是否存在贫血、甲状腺功能减退、抑郁等可逆因素；保证睡眠7-8小时/日。\n③运动强化：在现有活动基础上，增加抗阻训练（每周2次），预防肌少症。\n【随访】每3个月复查体重和疲乏程度，若体重继续下降或新增阳性指标，需及时转诊老年科。"
+}
+"""
+
+# 全局开关：是否启用动态相似案例嵌入（阶段4）
+_ENABLE_SIMILAR_CASES = False
+
+def generate_explanation(text, bert_pred, bert_conf, retry_count=0):
     knowledge = """
     【Fried衰弱表型标准】（5项，满足≥3项为衰弱）
     1. 不明原因体重下降：过去1年内体重下降≥5%或≥4.5kg
-    2. 疲乏/精力减退：自我报告“疲乏无力”、“整天没精神”等
+    2. 疲乏/精力减退：自我报告"疲乏无力"、"整天没精神"等
     3. 握力下降：用手握力计测量，根据性别和BMI调整阈值
     4. 步速减慢：行走4.57米时间延长（根据身高、性别调整）
     5. 活动量减少：每周消耗热量低于标准
     """
 
-    # 检索本地知识
+    # 检索本地知识（病历相关 + 干预相关）
     retrieved = retrieve_relevant_guidelines(text, top_k=5)
+    # 额外检索干预相关指南
+    intervention_queries = ["衰弱 营养 干预", "衰弱 运动 康复", "衰弱 跌倒 预防", "衰弱 药物 管理"]
+    for q in intervention_queries:
+        extra_retrieved = retrieve_relevant_guidelines(q, top_k=2)
+        if extra_retrieved:
+            retrieved.extend(extra_retrieved)
+    # 去重
+    seen = set()
+    unique_retrieved = []
+    for item in retrieved:
+        key = item.get("content", "")[:100]
+        if key not in seen:
+            seen.add(key)
+            unique_retrieved.append(item)
+    retrieved = unique_retrieved[:8]  # 最多8条
+    
     if retrieved:
         # 格式化为带来源的引用
         ref_lines = []
@@ -197,18 +300,45 @@ def generate_explanation(text, bert_pred, bert_conf):
         extra = "\n\n".join(ref_lines)
         knowledge += f"\n\n【本地循证指南】\n{extra}"
 
+    # 阶段4：动态嵌入相似分歧案例（反馈≥100条时自动启用）
+    similar_cases = ""
+    if _ENABLE_SIMILAR_CASES:
+        similar_cases = retrieve_similar_feedback_cases(text, top_k=2)
+        if similar_cases:
+            similar_cases = f"\n\n【历史类似病例参考】\n{similar_cases}"
+
     prompt = f"""你是一位老年医学专家。请严格依据【Fried衰弱表型标准】对患者进行逐项评估，不得使用任何非标准术语。
 
     {knowledge}
+
+    {FEW_SHOT_EXAMPLE}
+    {similar_cases}
+
+    【临床建议生成规则】（必须遵守）
+    1. 建议必须根据阳性指标的具体组合生成，不得使用千篇一律的模板。
+    2. 每项阳性指标必须对应具体的干预措施：
+       - 体重下降阳性 → 营养干预：蛋白质摄入量、ONS补充、维生素D/钙、排查原因
+       - 疲乏阳性 → 评估可逆因素（贫血、甲减、抑郁、睡眠）、能量管理
+       - 握力下降阳性 → 抗阻训练方案（频率、强度、肌群）、蛋白质补充
+       - 步速减慢阳性 → 平衡训练、有氧运动、辅助器具、跌倒预防
+       - 活动量减少阳性 → 渐进性运动计划、社交活动、心理支持
+    3. 建议应分层：
+       - 第一层：针对具体阳性指标的精准干预
+       - 第二层：综合管理和随访计划
+       - 第三层：转诊建议（如需要多学科团队）
+    4. 建议中必须包含具体的数值（如蛋白质1.2g/kg、维生素D 800IU等）。
+    5. 非衰弱患者：给出健康维持和预防建议，而非治疗建议。
+    6. 衰弱前期患者：强调早期干预和逆转可能性，给出积极可操作的方案。
+    7. 如需引用知识库，请在建议末尾注明来源编号。
 
     【患者信息】
     {text}
 
     请逐项判断，并严格按以下JSON Schema输出。注意：
-    - fried_items数组中每一项的"name"必须**完全使用上述标准名称**（例如“不明原因体重下降”），不得自创或替换为疾病名称。
-    - evidence字段必须直接引用病历中与该标准相关的原始描述，若病历未提及则填写“未提及”。
-    - conclusion仅依据阳性计数得出（≥3项为“衰弱”，1-2项为“衰弱前期”，0项为“非衰弱”）。
-    - suggestions中如需引用知识库，请注明来源编号。
+    - fried_items数组中每一项的"name"必须**完全使用上述标准名称**（例如"不明原因体重下降"），不得自创或替换为疾病名称。
+    - evidence字段必须直接引用病历中与该标准相关的原始描述，若病历未提及则填写"未提及"。
+    - conclusion仅依据阳性计数得出（≥3项为"衰弱"，1-2项为"衰弱前期"，0项为"非衰弱"）。
+    - suggestions必须根据上述【临床建议生成规则】生成个性化、具体、可操作的临床建议，不得使用笼统模板。
 
     JSON Schema:
     {json.dumps(EXPECTED_JSON_SCHEMA, ensure_ascii=False, indent=2)}
@@ -230,17 +360,527 @@ def generate_explanation(text, bert_pred, bert_conf):
             try:
                 data = json.loads(raw_json)
                 if all(k in data for k in ["fried_items", "positive_count", "conclusion", "suggestions"]):
-                    return data
+                    # 校验通过后返回
+                    if validate_fried_items(data):
+                        return data
+                    else:
+                        # 格式校验失败，尝试重试
+                        if retry_count < 3:
+                            print(f"⚠️ LLM 输出格式校验失败，第 {retry_count + 1} 次重试...")
+                            return generate_explanation(text, bert_pred, bert_conf, retry_count + 1)
+                        else:
+                            return {"error": "LLM 多次重试后仍返回格式错误", "raw": raw_json}
                 else:
-                    return {"error": "LLM 返回的 JSON 缺少必要字段", "raw": raw_json}
+                    if retry_count < 3:
+                        print(f"⚠️ LLM 返回缺少必要字段，第 {retry_count + 1} 次重试...")
+                        return generate_explanation(text, bert_pred, bert_conf, retry_count + 1)
+                    else:
+                        return {"error": "LLM 多次重试后仍缺少必要字段", "raw": raw_json}
             except json.JSONDecodeError:
-                return {"error": "LLM 返回的不是有效 JSON", "raw": raw_json}
+                if retry_count < 3:
+                    print(f"⚠️ LLM 返回非有效 JSON，第 {retry_count + 1} 次重试...")
+                    return generate_explanation(text, bert_pred, bert_conf, retry_count + 1)
+                else:
+                    return {"error": "LLM 多次重试后仍返回无效 JSON", "raw": raw_json}
         else:
             return {"error": f"Ollama 返回错误，状态码：{response.status_code}"}
     except requests.exceptions.ConnectionError:
         return {"error": "无法连接到 Ollama，请确保已启动 ollama serve 并下载了相应模型。"}
     except Exception as e:
         return {"error": f"请求异常：{str(e)}"}
+
+
+# ================= 反馈数据库模块（含 JSONL 防丢失 + 导出 + 同步） =================
+FEEDBACK_DB_PATH = os.path.join(BASE_DIR, "feedback.db")
+FEEDBACK_LOG_PATH = os.path.join(BASE_DIR, "feedback_log.jsonl")
+
+def init_feedback_db():
+    """初始化反馈数据库，创建 feedback 表，并从 JSONL 日志同步缺失记录"""
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text_hash TEXT NOT NULL,
+            patient_text TEXT NOT NULL,
+            bert_prediction TEXT NOT NULL,
+            bert_confidence REAL NOT NULL,
+            llm_conclusion TEXT,
+            llm_positive_count INTEGER,
+            llm_suggestions TEXT,
+            doctor_correction TEXT,
+            correction_reason TEXT,
+            doctor_name TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(text_hash, created_at)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print(f"✅ 反馈数据库初始化完成：{FEEDBACK_DB_PATH}")
+    # 启动时从日志同步（崩溃恢复）
+    sync_feedback_from_log()
+
+def _append_feedback_log(record: dict):
+    """追加写入 JSONL 日志文件，每行一条独立 JSON，确保即使系统崩溃也不丢失"""
+    try:
+        with open(FEEDBACK_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())  # 强制刷盘
+    except Exception as e:
+        print(f"⚠️ 反馈日志写入失败：{e}")
+
+def save_feedback(patient_text, bert_pred, bert_conf, llm_conclusion, llm_positive_count,
+                  llm_suggestions, doctor_correction, correction_reason, doctor_name=""):
+    """保存医生反馈到数据库，同时追加 JSONL 日志防丢失"""
+    text_hash = hashlib.sha256(patient_text.encode("utf-8")).hexdigest()[:16]
+    created_at = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+
+    # 1. 先写日志（即使数据库失败，日志也保留）
+    log_record = {
+        "text_hash": text_hash,
+        "patient_text": patient_text,
+        "bert_prediction": bert_pred,
+        "bert_confidence": bert_conf,
+        "llm_conclusion": llm_conclusion,
+        "llm_positive_count": llm_positive_count,
+        "llm_suggestions": llm_suggestions,
+        "doctor_correction": doctor_correction,
+        "correction_reason": correction_reason,
+        "doctor_name": doctor_name,
+        "created_at": created_at
+    }
+    _append_feedback_log(log_record)
+
+    # 2. 再写数据库
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO feedback 
+        (text_hash, patient_text, bert_prediction, bert_confidence, llm_conclusion,
+         llm_positive_count, llm_suggestions, doctor_correction, correction_reason, doctor_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (text_hash, patient_text, bert_pred, bert_conf, llm_conclusion,
+          llm_positive_count, llm_suggestions, doctor_correction, correction_reason, doctor_name, created_at))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_feedback_stats():
+    """获取反馈统计信息"""
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM feedback")
+    total = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM feedback WHERE doctor_correction != llm_conclusion")
+    disagreements = cursor.fetchone()[0]
+    conn.close()
+    return {"total": total, "disagreements": disagreements}
+
+def export_feedback_to_csv(csv_path=None):
+    """导出所有反馈为 CSV 文件，供离线分析"""
+    if csv_path is None:
+        csv_path = os.path.join(BASE_DIR, f"feedback_export_{QDateTime.currentDateTime().toString('yyyyMMdd_hhmmss')}.csv")
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM feedback ORDER BY created_at DESC", conn)
+    conn.close()
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return csv_path
+
+def get_high_frequency_disagreements(top_n=5):
+    """获取高频分歧案例（医生校正与模型结论不一致），用于优化 Prompt"""
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT patient_text, bert_prediction, llm_conclusion, doctor_correction, correction_reason
+        FROM feedback
+        WHERE doctor_correction != llm_conclusion
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (top_n,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            "patient_text": r[0],
+            "bert_prediction": r[1],
+            "llm_conclusion": r[2],
+            "doctor_correction": r[3],
+            "correction_reason": r[4]
+        }
+        for r in rows
+    ]
+
+def sync_feedback_from_log():
+    """从 JSONL 日志文件同步缺失的记录到数据库（崩溃恢复用）"""
+    if not os.path.exists(FEEDBACK_LOG_PATH):
+        return 0
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    cursor = conn.cursor()
+    synced = 0
+    with open(FEEDBACK_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                cursor.execute(
+                    "SELECT COUNT(*) FROM feedback WHERE text_hash = ? AND created_at = ?",
+                    (record["text_hash"], record["created_at"])
+                )
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute("""
+                        INSERT INTO feedback 
+                        (text_hash, patient_text, bert_prediction, bert_confidence, llm_conclusion,
+                         llm_positive_count, llm_suggestions, doctor_correction, correction_reason, doctor_name, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        record["text_hash"], record["patient_text"], record["bert_prediction"],
+                        record["bert_confidence"], record["llm_conclusion"], record["llm_positive_count"],
+                        record["llm_suggestions"], record["doctor_correction"], record["correction_reason"],
+                        record["doctor_name"], record["created_at"]
+                    ))
+                    synced += 1
+            except Exception as e:
+                print(f"⚠️ 日志同步跳过一行：{e}")
+    conn.commit()
+    conn.close()
+    if synced > 0:
+        print(f"✅ 从日志同步 {synced} 条反馈到数据库")
+    return synced
+
+
+# ================= 持续学习：全自动优化调度器 =================
+
+# 阶段阈值配置
+STAGE_THRESHOLDS = {
+    "prompt_update": 20,      # 阶段2：自动更新 Prompt
+    "bert_finetune": 50,    # 阶段3：自动增量微调 BERT
+    "similar_cases": 100,     # 阶段4：启用动态相似案例嵌入
+}
+
+# 记录已触发的阶段（避免重复触发）
+_triggered_stages = set()
+
+def _check_and_trigger_learning():
+    """
+    检查反馈数量，达到阈值时自动触发对应的优化阶段。
+    在每次 save_feedback 后调用。
+    """
+    global _ENABLE_SIMILAR_CASES
+    stats = get_feedback_stats()
+    total = stats["total"]
+    disagreements = stats["disagreements"]
+
+    print(f"📊 当前反馈统计：总计 {total} 条，分歧 {disagreements} 条")
+
+    # 阶段2：≥20 条分歧 → 自动更新 Prompt
+    if disagreements >= STAGE_THRESHOLDS["prompt_update"] and "prompt_update" not in _triggered_stages:
+        print(f"🎯 触发阶段2：分歧样本达到 {disagreements} 条，自动更新 Prompt...")
+        update_prompt_with_feedback()
+        _triggered_stages.add("prompt_update")
+
+    # 阶段3：≥50 条分歧 → 自动增量微调 BERT（在后台线程中执行，避免阻塞 UI）
+    if disagreements >= STAGE_THRESHOLDS["bert_finetune"] and "bert_finetune" not in _triggered_stages:
+        print(f"🎯 触发阶段3：分歧样本达到 {disagreements} 条，自动增量微调 BERT...")
+        # 启动后台线程执行微调，避免阻塞 UI
+        thread = AutoFinetuneThread()
+        thread.finished.connect(_on_bert_finetune_complete)
+        thread.start()
+        _triggered_stages.add("bert_finetune")
+
+    # 阶段4：≥100 条分歧 → 启用动态相似案例嵌入
+    if disagreements >= STAGE_THRESHOLDS["similar_cases"] and "similar_cases" not in _triggered_stages:
+        print(f"🎯 触发阶段4：分歧样本达到 {disagreements} 条，启用动态相似案例嵌入...")
+        _ENABLE_SIMILAR_CASES = True
+        _triggered_stages.add("similar_cases")
+
+def _on_bert_finetune_complete(new_model_path):
+    """BERT 增量微调完成后的回调：热切换模型"""
+    if new_model_path and os.path.exists(new_model_path):
+        print(f"🔄 BERT 新模型已生成：{new_model_path}")
+        # 通知用户，建议重启或提供热切换选项
+        # 实际热切换需要主窗口配合，这里先打印提示
+    else:
+        print("⚠️ BERT 增量微调失败或未达条件")
+
+class AutoFinetuneThread(QThread):
+    """后台自动微调 BERT 的线程，避免阻塞 UI"""
+    finished = Signal(str)  # 返回新模型路径
+
+    def run(self):
+        try:
+            new_path = incremental_finetune_bert(min_samples=50)
+            self.finished.emit(new_path or "")
+        except Exception as e:
+            print(f"❌ 自动微调失败：{e}")
+            self.finished.emit("")
+
+
+# ================= 持续学习：BERT 增量微调 =================
+
+def prepare_feedback_training_data(min_samples=50):
+    """
+    从反馈数据库中提取医生校正的数据，准备增量微调。
+    只取 doctor_correction != bert_prediction 的样本（模型错了的才有学习价值）。
+    """
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT patient_text, doctor_correction 
+        FROM feedback 
+        WHERE doctor_correction != bert_prediction
+    """, conn)
+    conn.close()
+
+    if len(df) < min_samples:
+        print(f"⚠️ 分歧样本仅 {len(df)} 条，建议积累到 {min_samples} 条再微调")
+        return None
+
+    # 标签映射：衰弱前期也归入衰弱类（二分类）
+    label_map = {"非衰弱": 0, "衰弱前期": 1, "衰弱": 1}
+    df["label"] = df["doctor_correction"].map(label_map)
+    df = df.dropna(subset=["label"])
+    df["label"] = df["label"].astype(int)
+
+    return df[["patient_text", "label"]]
+
+def incremental_finetune_bert(min_samples=50, output_dir=None):
+    """
+    增量微调 BERT：冻结底层，只训练分类头，防止灾难性遗忘。
+    保存为新版本，不覆盖原模型。
+    """
+    if output_dir is None:
+        # 自动寻找下一个版本号
+        v = 2
+        while os.path.exists(os.path.join(BASE_DIR, f"frailty_bert_demo_model_v{v}")):
+            v += 1
+        output_dir = os.path.join(BASE_DIR, f"frailty_bert_demo_model_v{v}")
+
+    df = prepare_feedback_training_data(min_samples)
+    if df is None:
+        return None
+
+    print(f"🚀 开始增量微调 BERT，使用 {len(df)} 条分歧样本...")
+
+    # 加载现有模型
+    tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_PATH)
+    model = BertForSequenceClassification.from_pretrained(BERT_MODEL_PATH, num_labels=2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # 冻结 BERT 底层（保留通用语义能力），只训练分类头
+    for param in model.bert.parameters():
+        param.requires_grad = False
+
+    # 数据准备
+    train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
+    dataset = DatasetDict({
+        "train": Dataset.from_pandas(train_df),
+        "eval": Dataset.from_pandas(eval_df)
+    })
+
+    def tokenize(batch):
+        return tokenizer(batch["patient_text"], padding="max_length", truncation=True, max_length=256)
+
+    tokenized = dataset.map(tokenize, batched=True)
+    tokenized = tokenized.rename_column("label", "labels")
+    tokenized.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+
+    # 训练参数（小学习率，少量步数，防止过拟合）
+    training_args = TrainingArguments(
+        output_dir=os.path.join(BASE_DIR, "frailty_bert_incremental"),
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=1e-5,          # 比初始训练更小
+        per_device_train_batch_size=4,
+        num_train_epochs=3,          # 少量 epoch 即可
+        weight_decay=0.01,
+        load_best_model_at_end=True,
+        logging_steps=10,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized["train"],
+        eval_dataset=tokenized["eval"],
+    )
+
+    trainer.train()
+
+    # 保存为新版本
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"✅ 增量微调完成，保存至 {output_dir}")
+    return output_dir
+
+
+# ================= 持续学习：LLM Prompt 动态优化 =================
+
+def generate_negative_few_shot_examples(top_n=3):
+    """
+    从反馈中提取高频分歧案例，生成【错误案例→正确示例】对照，
+    用于更新 Prompt 中的 Few-shot。
+    """
+    disagreements = get_high_frequency_disagreements(top_n)
+    if not disagreements:
+        return ""
+
+    examples = []
+    for d in disagreements:
+        examples.append(f"""
+【错误案例】
+患者：{d['patient_text'][:100]}...
+模型结论：{d['llm_conclusion']}
+医生校正：{d['doctor_correction']}
+原因：{d['correction_reason']}
+
+【正确做法】
+{d['correction_reason']}，因此应判定为"{d['doctor_correction']}"。
+""")
+    return "\n".join(examples)
+
+def update_prompt_with_feedback():
+    """将分歧案例融入 Prompt，作为反例提示"""
+    global FEW_SHOT_EXAMPLE
+    negative_examples = generate_negative_few_shot_examples(3)
+
+    if negative_examples:
+        FEW_SHOT_EXAMPLE = f"""
+【正例】
+患者信息：患者男性，82岁，近1年体重下降5kg，自觉疲乏无力，握力下降，步速减慢，活动量减少。
+正确结论：衰弱
+
+【常见错误警示】
+{negative_examples}
+
+请严格区分以下情况：
+- 卒中/骨折等疾病导致的肌力下降 ≠ Fried 标准的"握力下降"
+- 术后卧床 ≠ Fried 标准的"活动量减少"
+- 只有无明确病因的生理性储备下降才符合 Fried 标准
+"""
+        print("✅ Prompt 已更新，融入历史分歧案例")
+    else:
+        print("⚠️ 暂无分歧案例，Prompt 保持默认")
+
+def retrieve_similar_feedback_cases(patient_text, top_k=2):
+    """
+    用文本相似度检索历史分歧案例，嵌入到当前 Prompt。
+    使用 BGE 嵌入模型计算病历相似度。
+    """
+    conn = sqlite3.connect(FEEDBACK_DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT patient_text, doctor_correction, correction_reason 
+        FROM feedback 
+        WHERE doctor_correction != llm_conclusion
+    """, conn)
+    conn.close()
+
+    if len(df) == 0:
+        return ""
+
+    # 计算当前病历与历史分歧案例的嵌入相似度
+    query_emb = embedding_model.encode([patient_text])
+    case_embs = embedding_model.encode(df["patient_text"].tolist())
+
+    # 计算余弦相似度
+    similarities = []
+    for case_emb in case_embs:
+        sim = dot(query_emb, case_emb) / (norm(query_emb) * norm(case_emb))
+        similarities.append(sim[0])
+
+    df["similarity"] = similarities
+    df = df.sort_values("similarity", ascending=False).head(top_k)
+
+    cases = []
+    for _, row in df.iterrows():
+        cases.append(f"""
+类似病例参考（相似度 {row['similarity']:.3f}）：
+患者：{row['patient_text'][:80]}...
+医生校正：{row['doctor_correction']}
+理由：{row['correction_reason']}
+""")
+
+    return "\n".join(cases)
+
+
+# ================= 反馈对话框 =================
+class FeedbackDialog(QDialog):
+    def __init__(self, parent, bert_pred, llm_conclusion, patient_text):
+        super().__init__(parent)
+        self.setWindowTitle("医生反馈 - 评估结果校正")
+        self.setGeometry(200, 200, 500, 400)
+        self.patient_text = patient_text
+        self.bert_pred = bert_pred
+        self.llm_conclusion = llm_conclusion
+
+        layout = QVBoxLayout(self)
+
+        # 显示当前评估结果
+        info = QLabel(f"<b>BERT 预测：</b>{bert_pred}<br><b>LLM 结论：</b>{llm_conclusion}")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # 医生校正选择
+        layout.addWidget(QLabel("您认为正确的评估结论："))
+        self.combo_correction = QComboBox()
+        self.combo_correction.addItems(["衰弱", "衰弱前期", "非衰弱"])
+        if llm_conclusion in ["衰弱", "衰弱前期", "非衰弱"]:
+            self.combo_correction.setCurrentText(llm_conclusion)
+        layout.addWidget(self.combo_correction)
+
+        # 校正原因
+        layout.addWidget(QLabel("校正原因（选填）："))
+        self.text_reason = QDialogTextEdit()
+        self.text_reason.setPlaceholderText("请说明为什么认为当前评估不正确...")
+        self.text_reason.setMaximumHeight(80)
+        layout.addWidget(self.text_reason)
+
+        # 医生姓名
+        layout.addWidget(QLabel("医生姓名（选填）："))
+        self.line_doctor = QLineEdit()
+        layout.addWidget(self.line_doctor)
+
+        # 按钮
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_feedback_data(self):
+        return {
+            "doctor_correction": self.combo_correction.currentText(),
+            "correction_reason": self.text_reason.toPlainText().strip(),
+            "doctor_name": self.line_doctor.text().strip()
+        }
+
+
+# ================= 病历缺失指标检查 =================
+FRIED_KEYWORDS = {
+    "不明原因体重下降": ["体重下降", "体重减轻", "消瘦", "体重减少", "体重降低"],
+    "疲乏/精力减退": ["疲乏", "乏力", "无力", "没精神", "精力减退", "疲惫", "倦怠"],
+    "握力下降": ["握力", "手力", "抓握"],
+    "步速减慢": ["步速", "步态", "行走缓慢", "走路慢", "步行速度"],
+    "活动量减少": ["活动量", "活动减少", "卧床", "不愿活动", "运动减少"]
+}
+
+def check_missing_indicators(text):
+    """
+    检查病历中是否缺失 Fried 衰弱评估所需的关键指标。
+    返回缺失的指标列表和匹配到的指标列表。
+    """
+    text_lower = text.lower()
+    missing = []
+    matched = []
+    for indicator, keywords in FRIED_KEYWORDS.items():
+        found = any(kw in text_lower for kw in keywords)
+        if found:
+            matched.append(indicator)
+        else:
+            missing.append(indicator)
+    return missing, matched
 
 def format_explanation_html(data):
     if "error" in data:
@@ -323,6 +963,65 @@ class OllamaHealthCheckThread(QThread):
             self.status_signal.emit(False, f"❌ 检测 Ollama 时出错：{str(e)}")
 
 
+# ================= 批量标注后台线程 =================
+
+class BatchImportThread(QThread):
+    """后台导入病历文件，避免阻塞UI"""
+    progress = Signal(int, int, str)  # current, total, message
+    finished_signal = Signal(int, int, str)  # imported, skipped, message
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        try:
+            init_batch_annotation_db()
+            imported = import_batch_records(self.file_path)
+            self.finished_signal.emit(imported, 0, f"导入完成：新增 {imported} 条记录")
+        except Exception as e:
+            self.finished_signal.emit(0, 0, f"导入失败：{str(e)}")
+
+
+class BatchLLMThread(QThread):
+    """后台LLM预标注线程"""
+    progress = Signal(int, int, str)
+    finished_signal = Signal(int, str)
+
+    def __init__(self, limit=None):
+        super().__init__()
+        self.limit = limit
+
+    def run(self):
+        try:
+            annotated = auto_annotate_with_llm(limit=self.limit)
+            self.finished_signal.emit(annotated, f"LLM预标注完成：{annotated} 条")
+        except Exception as e:
+            self.finished_signal.emit(0, f"LLM预标注失败：{str(e)}")
+
+
+class BatchRetrainThread(QThread):
+    """后台BERT重训练线程"""
+    progress = Signal(str)
+    finished_signal = Signal(str, str)  # model_path or None, message
+
+    def __init__(self, min_samples=100, epochs=5):
+        super().__init__()
+        self.min_samples = min_samples
+        self.epochs = epochs
+
+    def run(self):
+        try:
+            self.progress.emit("正在准备训练数据...")
+            output_dir = full_retrain_bert(min_samples=self.min_samples, epochs=self.epochs)
+            if output_dir:
+                self.finished_signal.emit(output_dir, f"训练完成！新模型：{output_dir}")
+            else:
+                self.finished_signal.emit("", "训练未执行：样本不足或数据缺失")
+        except Exception as e:
+            self.finished_signal.emit("", f"训练失败：{str(e)}")
+
+
 # ================= 5. 主窗口 =================
 
 class FrailtyMainWindow(QMainWindow):
@@ -365,6 +1064,7 @@ class FrailtyMainWindow(QMainWindow):
         # 菜单/工具栏动作
         self.action_load_case = self.ui.findChild(QAction, "action_load_case")
         self.action_batch_import = self.ui.findChild(QAction, "action_batch_import")
+        self.action_batch_annotation = self.ui.findChild(QAction, "action_batch_annotation")
         self.action_exit = self.ui.findChild(QAction, "action_exit")
         self.action_model_info = self.ui.findChild(QAction, "action_model_info")
         self.action_ollama_status = self.ui.findChild(QAction, "action_ollama_status")
@@ -409,6 +1109,8 @@ class FrailtyMainWindow(QMainWindow):
         self.patient_table.cellDoubleClicked.connect(self.on_table_row_double_clicked)
 
         self.action_batch_import.triggered.connect(self.on_batch_import)
+        if self.action_batch_annotation:
+            self.action_batch_annotation.triggered.connect(self._open_batch_annotation_dialog)
 
         # 占位功能
         def placeholder(title):
@@ -425,8 +1127,50 @@ class FrailtyMainWindow(QMainWindow):
         self.ollama_check_thread.status_signal.connect(self.on_ollama_status)
         self.ollama_check_thread.start()
 
+        # 初始化反馈数据库
+        init_feedback_db()
+
+        # 添加反馈按钮（从 UI 文件加载）
+        self.btn_feedback = self.ui.findChild(QPushButton, "btn_feedback")
+        if self.btn_feedback:
+            self.btn_feedback.clicked.connect(self.on_feedback)
+        else:
+            # 备用：如果 UI 中没有，动态创建
+            self.btn_feedback = QPushButton("💡 提交反馈", self)
+            self.btn_feedback.setGeometry(600, 580, 120, 30)
+            self.btn_feedback.clicked.connect(self.on_feedback)
+            self.btn_feedback.setEnabled(False)
+
         self.explain_thread = None
+        self._last_explanation = None
+        self._last_patient_text = ""
+        self._last_bert_result = None
+
+        # ===== 批量标注与模型训练面板（改为独立窗口，通过工具菜单打开） =====
+        self._batch_annotation_dialog = None  # 延迟创建
+
         print("主窗口初始化完成")
+
+    def _open_batch_annotation_dialog(self):
+        """打开批量标注与模型训练独立窗口"""
+        if self._batch_annotation_dialog is None:
+            self._batch_annotation_dialog = BatchAnnotationDialog(self)
+        self._batch_annotation_dialog.show()
+        self._batch_annotation_dialog.raise_()
+        self._batch_annotation_dialog.activateWindow()
+
+
+    # ---------- 原有反馈按钮方法 ----------
+
+    def _enable_feedback_button(self):
+        """评估完成后启用反馈按钮"""
+        if self.btn_feedback:
+            self.btn_feedback.setEnabled(True)
+
+    def _disable_feedback_button(self):
+        """新评估开始时禁用反馈按钮"""
+        if self.btn_feedback:
+            self.btn_feedback.setEnabled(False)
 
 
 
@@ -446,6 +1190,22 @@ class FrailtyMainWindow(QMainWindow):
         if not text:
             QMessageBox.warning(self, "提示", "请输入病历文本！")
             return
+        # 检查病历中是否缺失 Fried 关键指标
+        missing, matched = check_missing_indicators(text)
+        if len(missing) >= 3:
+            reply = QMessageBox.question(
+                self,
+                "病历数据缺失警告",
+                f"当前病历中缺少以下 {len(missing)} 项 Fried 衰弱评估关键指标：\n\n" +
+                "\n".join([f"  • {m}" for m in missing]) +
+                f"\n\n仅匹配到 {len(matched)} 项：" + (", ".join(matched) if matched else "无") +
+                "\n\n缺少关键指标可能导致评估结果不可靠，是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                self.status_bar.showMessage("用户取消评估：病历数据缺失", 3000)
+                return
         self.status_bar.showMessage("正在进行快速预测...")
         result = predict_frailty(text, self.tokenizer, self.model, self.device)
         output = f"预测结论：{result['prediction']}\n置信度：{result['confidence']:.4f}"
@@ -460,6 +1220,22 @@ class FrailtyMainWindow(QMainWindow):
         if not text:
             QMessageBox.warning(self, "提示", "请输入病历文本！")
             return
+        # 检查病历中是否缺失 Fried 关键指标
+        missing, matched = check_missing_indicators(text)
+        if len(missing) >= 3:
+            reply = QMessageBox.question(
+                self,
+                "病历数据缺失警告",
+                f"当前病历中缺少以下 {len(missing)} 项 Fried 衰弱评估关键指标：\n\n" +
+                "\n".join([f"  • {m}" for m in missing]) +
+                f"\n\n仅匹配到 {len(matched)} 项：" + (", ".join(matched) if matched else "无") +
+                "\n\n缺少关键指标可能导致评估结果不可靠，是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                self.status_bar.showMessage("用户取消评估：病历数据缺失", 3000)
+                return
         bert_result = predict_frailty(text, self.tokenizer, self.model, self.device)
         if bert_result["prediction"] == "未知":
             QMessageBox.warning(self, "提示", "病历文本无效，无法生成详细解释。")
@@ -478,6 +1254,8 @@ class FrailtyMainWindow(QMainWindow):
         self.explain_thread = ExplanationThread(text, pred, conf)
         self.explain_thread.finished.connect(self.on_explanation_ready)
         self.explain_thread.finished.connect(lambda: self.action_explain_predict.setEnabled(True))
+        self.explain_thread.finished.connect(self._enable_feedback_button)
+        self._disable_feedback_button()
         self.explain_thread.start()
 
     @Slot(dict)
@@ -485,12 +1263,66 @@ class FrailtyMainWindow(QMainWindow):
         if "error" in explanation_dict or not validate_fried_items(explanation_dict):
             # 显示错误或要求重新生成
             self.explain_display.setHtml("<p style='color:red;'>❌ 评估格式错误，未正确使用Fried标准，请重试。</p>")
+            self._disable_feedback_button()
             return
+        # 保存当前解释结果，用于后续反馈
+        self._last_explanation = explanation_dict
+        self._last_patient_text = self.text_input.toPlainText().strip()
+        self._last_bert_result = predict_frailty(self._last_patient_text, self.tokenizer, self.model, self.device)
         html_content = format_explanation_html(explanation_dict)
-        self.explain_display.setHtml(html_content)
+        # 在报告末尾追加反馈按钮提示
+        feedback_html = """
+        <hr>
+        <p><b>💡 医生反馈</b></p>
+        <p>如果您认为上述评估结果不正确，请点击窗口右下角的【提交反馈】按钮提交校正意见，帮助我们改进模型。</p>
+        """
+        self.explain_display.setHtml(html_content + feedback_html)
         if self.result_tabs is not None:
             self.result_tabs.setCurrentIndex(1)
         self.status_bar.showMessage("详细解释已生成", 5000)
+
+    @Slot()
+    def on_feedback(self):
+        """打开反馈对话框并保存医生校正意见，保存后自动触发持续学习检查"""
+        if not hasattr(self, '_last_explanation') or not self._last_explanation:
+            QMessageBox.warning(self, "提示", "请先进行一次详细评估，再提交反馈。")
+            return
+        bert_pred = self._last_bert_result.get("prediction", "未知")
+        bert_conf = self._last_bert_result.get("confidence", 0.0)
+        llm_conclusion = self._last_explanation.get("conclusion", "未知")
+        llm_positive_count = self._last_explanation.get("positive_count", 0)
+        llm_suggestions = self._last_explanation.get("suggestions", "")
+        patient_text = self._last_patient_text
+
+        dialog = FeedbackDialog(self, bert_pred, llm_conclusion, patient_text)
+        if dialog.exec() == QDialog.Accepted:
+            data = dialog.get_feedback_data()
+            try:
+                save_feedback(
+                    patient_text=patient_text,
+                    bert_pred=bert_pred,
+                    bert_conf=bert_conf,
+                    llm_conclusion=llm_conclusion,
+                    llm_positive_count=llm_positive_count,
+                    llm_suggestions=llm_suggestions,
+                    doctor_correction=data["doctor_correction"],
+                    correction_reason=data["correction_reason"],
+                    doctor_name=data["doctor_name"]
+                )
+                stats = get_feedback_stats()
+                QMessageBox.information(
+                    self, "反馈已保存",
+                    f"感谢您的反馈！\n\n"
+                    f"累计反馈：{stats['total']} 条\n"
+                    f"与模型结论不一致：{stats['disagreements']} 条"
+                )
+                self.status_bar.showMessage(f"反馈已保存，累计 {stats['total']} 条", 3000)
+
+                # ===== 自动触发持续学习 =====
+                _check_and_trigger_learning()
+
+            except Exception as e:
+                QMessageBox.critical(self, "保存失败", f"反馈保存失败：{str(e)}")
 
     @Slot()
     def load_case_from_file(self):
@@ -731,9 +1563,582 @@ class FrailtyMainWindow(QMainWindow):
                 item.setFont(font)
             self.patient_table.setItem(row, col, item)
 
-        # 保存完整病历文本到“文件名”列的用户角色中，用于双击加载
+        # 保存完整病历文本到"文件名"列的用户角色中，用于双击加载
         full_text = result.get("full_text", "")
         self.patient_table.item(row, 3).setData(Qt.UserRole, full_text)
+
+
+# ================= 批量标注与模型训练独立对话框 =================
+
+class BatchAnnotationDialog(QDialog):
+    """批量标注与模型训练独立对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📚 批量标注与模型训练")
+        self.setGeometry(100, 100, 1200, 850)
+        self.parent_window = parent
+        self._review_records_map = {}
+        self._normal_geometry = None  # 保存正常窗口大小
+
+        # 初始化数据库
+        init_batch_annotation_db()
+
+        # 设置白色底色
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #ffffff;
+            }
+            QGroupBox {
+                background-color: #ffffff;
+            }
+            QLabel {
+                background-color: transparent;
+                color: #2c3e50;
+            }
+            QPushButton {
+                background-color: #f8f9fa;
+                color: #2c3e50;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #e9ecef;
+            }
+            QLineEdit {
+                background-color: #ffffff;
+                color: #2c3e50;
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QTextEdit {
+                background-color: #fafbfc;
+                color: #2c3e50;
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+            }
+            QTableWidget {
+                background-color: #ffffff;
+                color: #2c3e50;
+                alternate-background-color: #f5f7fa;
+                gridline-color: #dcdcdc;
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+            }
+            QTableWidget::item {
+                color: #2c3e50;
+                padding: 4px;
+            }
+            QTableWidget::item:selected {
+                background-color: #3498db;
+                color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #ecf0f1;
+                color: #2c3e50;
+                border: 1px solid #bdc3c7;
+                padding: 6px;
+                font-weight: bold;
+            }
+        """)
+
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+
+        # 统一字体
+        self.setFont(QFont("Microsoft YaHei", 10))
+
+        # ========== 顶部窗口控制栏 ==========
+        window_control = QHBoxLayout()
+        window_control.addWidget(QLabel("<b>📚 批量标注与模型训练</b>"))
+        window_control.addStretch()
+
+        # 窗口控制按钮
+        btn_minimize = QPushButton("🗕 最小化")
+        btn_minimize.setFixedWidth(80)
+        btn_minimize.setToolTip("最小化窗口到任务栏")
+        btn_minimize.clicked.connect(self.showMinimized)
+        window_control.addWidget(btn_minimize)
+
+        btn_zoom_out = QPushButton("🔍-")
+        btn_zoom_out.setFixedWidth(50)
+        btn_zoom_out.setToolTip("缩小窗口")
+        btn_zoom_out.clicked.connect(self._zoom_out)
+        window_control.addWidget(btn_zoom_out)
+
+        btn_zoom_in = QPushButton("🔍+")
+        btn_zoom_in.setFixedWidth(50)
+        btn_zoom_in.setToolTip("放大窗口")
+        btn_zoom_in.clicked.connect(self._zoom_in)
+        window_control.addWidget(btn_zoom_in)
+
+        btn_fullscreen = QPushButton("⛶ 全屏")
+        btn_fullscreen.setFixedWidth(70)
+        btn_fullscreen.setToolTip("全屏显示（按 Esc 退出）")
+        btn_fullscreen.clicked.connect(self._toggle_fullscreen)
+        window_control.addWidget(btn_fullscreen)
+
+        btn_close = QPushButton("✕ 关闭")
+        btn_close.setFixedWidth(70)
+        btn_close.setToolTip("关闭窗口")
+        btn_close.setStyleSheet("background-color: #dc3545; color: white; border: none;")
+        btn_close.clicked.connect(self.hide)
+        window_control.addWidget(btn_close)
+
+        main_layout.addLayout(window_control)
+
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("color: #dee2e6;")
+        main_layout.addWidget(line)
+
+        # ========== 顶部状态栏 ==========
+        status_bar = QHBoxLayout()
+        self.batch_status_label = QLabel("📊 批量标注状态：未初始化")
+        self.batch_status_label.setStyleSheet("font-size: 13px; color: #2c3e50; font-weight: bold; background-color: transparent;")
+        status_bar.addWidget(self.batch_status_label)
+        status_bar.addStretch()
+
+        btn_refresh_status = QPushButton("🔄 刷新状态")
+        btn_refresh_status.setFixedWidth(120)
+        btn_refresh_status.clicked.connect(self._on_batch_refresh_status)
+        status_bar.addWidget(btn_refresh_status)
+        main_layout.addLayout(status_bar)
+
+        # 分隔线
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        line2.setStyleSheet("color: #dee2e6;")
+        main_layout.addWidget(line2)
+
+        # ========== 步骤1：导入病历 ==========
+        group_import = self._create_group_box("步骤1：导入脱密病历")
+        import_layout = QHBoxLayout(group_import)
+        btn_import = QPushButton("📁 选择 CSV/Excel 文件")
+        btn_import.setStyleSheet("font-weight: bold; padding: 8px 20px;")
+        btn_import.clicked.connect(self._on_batch_import_records)
+        import_layout.addWidget(btn_import)
+        self.batch_import_info = QLabel("未导入")
+        self.batch_import_info.setStyleSheet("color: #7f8c8d; margin-left: 10px;")
+        import_layout.addWidget(self.batch_import_info)
+        import_layout.addStretch()
+        main_layout.addWidget(group_import)
+
+        # ========== 步骤2：LLM 预标注 ==========
+        group_llm = self._create_group_box("步骤2：LLM 详细预标注")
+        llm_layout = QHBoxLayout(group_llm)
+        btn_auto_llm = QPushButton("🤖 运行 LLM 预标注")
+        btn_auto_llm.setStyleSheet("padding: 8px 20px;")
+        btn_auto_llm.clicked.connect(self._on_batch_auto_llm)
+        llm_layout.addWidget(btn_auto_llm)
+        self.batch_llm_info = QLabel("未执行")
+        self.batch_llm_info.setStyleSheet("color: #7f8c8d; margin-left: 10px;")
+        llm_layout.addWidget(self.batch_llm_info)
+        llm_layout.addStretch()
+        main_layout.addWidget(group_llm)
+
+        # ========== 步骤3-4：人工审核标注 ==========
+        group_review = self._create_group_box("步骤3-4：人工审核标注")
+        review_main = QVBoxLayout(group_review)
+
+        # 加载按钮
+        review_header = QHBoxLayout()
+        btn_load_review = QPushButton("🔄 加载待审核记录")
+        btn_load_review.setStyleSheet("padding: 6px 16px;")
+        btn_load_review.clicked.connect(self._on_batch_load_review)
+        review_header.addWidget(btn_load_review)
+        review_header.addWidget(QLabel("<span style='color:#7f8c8d;'>（优先显示不确定样本，黄色高亮）</span>"))
+        review_header.addStretch()
+        review_main.addLayout(review_header)
+
+        # 左右分栏：左侧表格，右侧病历文本
+        review_split = QHBoxLayout()
+
+        # 左侧：表格 + 审核按钮
+        left_panel = QVBoxLayout()
+        self.review_table = QTableWidget()
+        self.review_table.setColumnCount(5)
+        self.review_table.setHorizontalHeaderLabels([
+            "ID", "患者ID", "BERT预测", "BERT置信度", "LLM结论"
+        ])
+        self.review_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.review_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.review_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.review_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f5f7fa;
+                color: #2c3e50;
+                gridline-color: #dcdcdc;
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+            }
+            QTableWidget::item {
+                color: #2c3e50;
+                padding: 4px;
+            }
+            QTableWidget::item:selected {
+                background-color: #3498db;
+                color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #ecf0f1;
+                color: #2c3e50;
+                border: 1px solid #bdc3c7;
+                padding: 6px;
+                font-weight: bold;
+            }
+        """)
+        self.review_table.setAlternatingRowColors(True)
+        self.review_table.itemSelectionChanged.connect(self._on_review_row_selected)
+        left_panel.addWidget(self.review_table)
+
+        # 审核按钮区
+        review_actions = QHBoxLayout()
+        review_actions.addWidget(QLabel("<b>审核人：</b>"))
+        self.review_annotator_input = QLineEdit()
+        self.review_annotator_input.setPlaceholderText("输入医生姓名")
+        self.review_annotator_input.setFixedWidth(150)
+        review_actions.addWidget(self.review_annotator_input)
+        review_actions.addSpacing(20)
+
+        btn_label_frail = QPushButton("✅ 衰弱")
+        btn_label_frail.setStyleSheet("background-color: #e74c3c; color: white; padding: 6px 16px; font-weight: bold; border-radius: 4px;")
+        btn_label_frail.clicked.connect(lambda: self._on_batch_label_selected("衰弱"))
+        review_actions.addWidget(btn_label_frail)
+
+        btn_label_pre = QPushButton("⚠️ 衰弱前期")
+        btn_label_pre.setStyleSheet("background-color: #f39c12; color: white; padding: 6px 16px; font-weight: bold; border-radius: 4px;")
+        btn_label_pre.clicked.connect(lambda: self._on_batch_label_selected("衰弱前期"))
+        review_actions.addWidget(btn_label_pre)
+
+        btn_label_non = QPushButton("❌ 非衰弱")
+        btn_label_non.setStyleSheet("background-color: #27ae60; color: white; padding: 6px 16px; font-weight: bold; border-radius: 4px;")
+        btn_label_non.clicked.connect(lambda: self._on_batch_label_selected("非衰弱"))
+        review_actions.addWidget(btn_label_non)
+        review_actions.addStretch()
+        left_panel.addLayout(review_actions)
+
+        review_split.addLayout(left_panel, stretch=3)
+
+        # 右侧：病历文本显示区
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(QLabel("<b>📋 病历原文</b>"))
+        self.review_text_display = QTextEdit()
+        self.review_text_display.setReadOnly(True)
+        self.review_text_display.setPlaceholderText("点击左侧表格中的某一行，此处将显示该患者的完整病历文本...")
+        self.review_text_display.setStyleSheet("""
+            QTextEdit {
+                background-color: #fafbfc;
+                color: #2c3e50;
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                padding: 10px;
+                font-family: "Microsoft YaHei", sans-serif;
+                font-size: 12px;
+                line-height: 1.6;
+            }
+        """)
+        right_panel.addWidget(self.review_text_display)
+        review_split.addLayout(right_panel, stretch=2)
+
+        review_main.addLayout(review_split)
+        main_layout.addWidget(group_review, stretch=3)
+
+        # 分隔线
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        line2.setStyleSheet("color: #bdc3c7;")
+        main_layout.addWidget(line2)
+
+        # ========== 步骤5：数据分析 ==========
+        group_analyze = self._create_group_box("步骤5：数据分析")
+        analyze_layout = QHBoxLayout(group_analyze)
+        btn_analyze = QPushButton("📊 查看标注质量分析")
+        btn_analyze.setStyleSheet("padding: 8px 20px;")
+        btn_analyze.clicked.connect(self._on_batch_analyze)
+        analyze_layout.addWidget(btn_analyze)
+        self.batch_analyze_info = QLabel("未分析")
+        self.batch_analyze_info.setStyleSheet("color: #7f8c8d; margin-left: 10px;")
+        analyze_layout.addWidget(self.batch_analyze_info)
+        analyze_layout.addStretch()
+        main_layout.addWidget(group_analyze)
+
+        # ========== 步骤6：重训练 BERT ==========
+        group_retrain = self._create_group_box("步骤6：模型重训练")
+        retrain_layout = QHBoxLayout(group_retrain)
+        btn_retrain = QPushButton("🚀 全量重训练 BERT")
+        btn_retrain.setStyleSheet("font-weight: bold; padding: 8px 20px; background-color: #3498db; color: white; border-radius: 4px;")
+        btn_retrain.clicked.connect(self._on_batch_retrain)
+        retrain_layout.addWidget(btn_retrain)
+        retrain_layout.addSpacing(20)
+
+        retrain_layout.addWidget(QLabel("最少样本："))
+        self.retrain_min_samples = QLineEdit("100")
+        self.retrain_min_samples.setFixedWidth(60)
+        self.retrain_min_samples.setStyleSheet("padding: 4px; border: 1px solid #bdc3c7; border-radius: 3px;")
+        retrain_layout.addWidget(self.retrain_min_samples)
+
+        retrain_layout.addWidget(QLabel("Epoch："))
+        self.retrain_epochs = QLineEdit("5")
+        self.retrain_epochs.setFixedWidth(50)
+        self.retrain_epochs.setStyleSheet("padding: 4px; border: 1px solid #bdc3c7; border-radius: 3px;")
+        retrain_layout.addWidget(self.retrain_epochs)
+
+        self.batch_retrain_info = QLabel("未训练")
+        self.batch_retrain_info.setStyleSheet("color: #7f8c8d; margin-left: 10px;")
+        retrain_layout.addWidget(self.batch_retrain_info)
+        retrain_layout.addStretch()
+        main_layout.addWidget(group_retrain)
+
+        # ========== 步骤7：导出 ==========
+        group_export = self._create_group_box("步骤7：数据导出")
+        export_layout = QHBoxLayout(group_export)
+        btn_export = QPushButton("💾 导出标注数据（CSV）")
+        btn_export.setStyleSheet("padding: 8px 20px;")
+        btn_export.clicked.connect(self._on_batch_export)
+        export_layout.addWidget(btn_export)
+        self.batch_export_info = QLabel("未导出")
+        self.batch_export_info.setStyleSheet("color: #7f8c8d; margin-left: 10px;")
+        export_layout.addWidget(self.batch_export_info)
+        export_layout.addStretch()
+        main_layout.addWidget(group_export)
+
+        main_layout.addStretch()
+        self._on_batch_refresh_status()
+
+    def _create_group_box(self, title):
+        """创建统一风格的分组框"""
+        group = QGroupBox(title)
+        group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #2c3e50;
+                border: 1px solid #bdc3c7;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 8px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }
+        """)
+        return group
+
+    # ---------- 窗口控制方法 ----------
+
+    def _zoom_in(self):
+        """放大窗口（每次增加100x80像素）"""
+        geo = self.geometry()
+        new_width = min(geo.width() + 100, 1920)  # 最大1920
+        new_height = min(geo.height() + 80, 1080)  # 最大1080
+        self.setGeometry(geo.x(), geo.y(), new_width, new_height)
+
+    def _zoom_out(self):
+        """缩小窗口（每次减少100x80像素）"""
+        geo = self.geometry()
+        new_width = max(geo.width() - 100, 800)  # 最小800
+        new_height = max(geo.height() - 80, 600)  # 最小600
+        self.setGeometry(geo.x(), geo.y(), new_width, new_height)
+
+    def _toggle_fullscreen(self):
+        """切换全屏/正常模式"""
+        if self.isFullScreen():
+            self.showNormal()
+            if self._normal_geometry:
+                self.setGeometry(self._normal_geometry)
+        else:
+            self._normal_geometry = self.geometry()
+            self.showFullScreen()
+
+    def keyPressEvent(self, event):
+        """按 Esc 退出全屏"""
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            if self._normal_geometry:
+                self.setGeometry(self._normal_geometry)
+        else:
+            super().keyPressEvent(event)
+
+    # ---------- 信号槽方法 ----------
+
+    def _on_batch_refresh_status(self):
+        try:
+            stats = analyze_annotation_quality()
+            fb_stats = get_feedback_stats()
+            text = (f"📊 批量标注：总计 {stats['total']} 条 | 已标注 {stats['annotated']} 条 | "
+                    f"不确定 {stats['uncertain']} 条 | BERT-LLM一致 {stats['llm_agreement']}/{stats['llm_total']} | "
+                    f"医生反馈：{fb_stats['total']} 条（分歧 {fb_stats['disagreements']} 条）")
+            self.batch_status_label.setText(text)
+        except Exception as e:
+            self.batch_status_label.setText(f"📊 状态刷新失败：{e}")
+
+    def _on_batch_import_records(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择脱密病历文件", "",
+            "CSV/Excel (*.csv *.xlsx *.xls);;所有文件 (*)"
+        )
+        if not file_path:
+            return
+        self.batch_import_info.setText("⏳ 正在导入...")
+        self._batch_import_thread = BatchImportThread(file_path)
+        self._batch_import_thread.finished_signal.connect(self._on_batch_import_finished)
+        self._batch_import_thread.start()
+
+    def _on_batch_import_finished(self, imported, skipped, message):
+        self.batch_import_info.setText(message)
+        QMessageBox.information(self, "导入完成", message)
+        self._on_batch_refresh_status()
+
+    def _on_batch_auto_llm(self):
+        reply = QMessageBox.question(
+            self, "确认", "将对未标注记录调用 LLM 进行详细预标注，这可能需要较长时间。\n\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.batch_llm_info.setText("⏳ LLM 预标注中...")
+        self._batch_llm_thread = BatchLLMThread()
+        self._batch_llm_thread.finished_signal.connect(self._on_batch_llm_finished)
+        self._batch_llm_thread.start()
+
+    def _on_batch_llm_finished(self, annotated, message):
+        self.batch_llm_info.setText(message)
+        QMessageBox.information(self, "LLM 预标注", message)
+        self._on_batch_refresh_status()
+
+    def _on_batch_load_review(self):
+        records = get_records_for_review(limit=50, priority_uncertain=True)
+        self.review_table.setRowCount(0)
+        self._review_records_map = {}  # id -> patient_text
+        if not records:
+            QMessageBox.information(self, "提示", "没有待审核的记录，请先导入病历。")
+            return
+        for rec in records:
+            row = self.review_table.rowCount()
+            self.review_table.insertRow(row)
+            self.review_table.setItem(row, 0, QTableWidgetItem(str(rec["id"])))
+            self.review_table.setItem(row, 1, QTableWidgetItem(rec.get("patient_id", "")))
+            self.review_table.setItem(row, 2, QTableWidgetItem(rec.get("auto_bert_pred", "")))
+            conf = rec.get("auto_bert_conf", 0)
+            self.review_table.setItem(row, 3, QTableWidgetItem(f"{conf:.3f}" if conf else "N/A"))
+            self.review_table.setItem(row, 4, QTableWidgetItem(rec.get("auto_llm_conclusion", "未标注") or "未标注"))
+            # 存储病历文本用于点击显示
+            self._review_records_map[rec["id"]] = rec.get("patient_text", "")
+            # 标记不确定样本
+            if rec.get("is_uncertain", 0):
+                for c in range(5):
+                    self.review_table.item(row, c).setBackground(QColor("#fff3cd"))
+        self.review_text_display.setPlainText("点击左侧表格中的某一行，此处将显示该患者的完整病历文本。")
+
+    def _on_review_row_selected(self):
+        """点击表格行时，在右侧显示病历文本"""
+        selected = self.review_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        record_id_item = self.review_table.item(row, 0)
+        if record_id_item is None:
+            return
+        record_id = int(record_id_item.text())
+        text = self._review_records_map.get(record_id, "")
+        if text:
+            self.review_text_display.setPlainText(text)
+        else:
+            self.review_text_display.setPlainText("（该记录暂无病历文本）")
+
+    def _on_batch_label_selected(self, label):
+        selected = self.review_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "提示", "请先选中一行记录再标注。")
+            return
+        row = selected[0].row()
+        record_id_item = self.review_table.item(row, 0)
+        if record_id_item is None:
+            return
+        record_id = int(record_id_item.text())
+        annotator = self.review_annotator_input.text().strip() or "未知医生"
+        try:
+            submit_manual_label(record_id, label, annotator=annotator)
+            self._review_records_map.pop(record_id, None)
+            self.review_table.removeRow(row)
+            self.review_text_display.setPlainText("已标注，请选择下一条记录。")
+            self._on_batch_refresh_status()
+        except Exception as e:
+            QMessageBox.critical(self, "标注失败", f"保存标注失败：{str(e)}")
+
+    def _on_batch_analyze(self):
+        try:
+            stats = analyze_annotation_quality()
+            report = (f"📊 批量标注数据质量报告\n"
+                      f"━━━━━━━━━━━━━━━━━━━━\n"
+                      f"总记录数：{stats['total']}\n"
+                      f"已人工标注：{stats['annotated']} ({stats['annotated']/max(stats['total'],1)*100:.1f}%)\n"
+                      f"BERT 不确定样本：{stats['uncertain']}\n")
+            if stats['llm_total'] > 0:
+                report += f"BERT-LLM 一致性：{stats['llm_agreement']}/{stats['llm_total']} ({stats['llm_agreement']/max(stats['llm_total'],1)*100:.1f}%)\n"
+            report += "━━━━━━━━━━━━━━━━━━━━"
+            self.batch_analyze_info.setText(f"已分析：{stats['annotated']}/{stats['total']} 已标注")
+            QMessageBox.information(self, "标注质量分析", report)
+        except Exception as e:
+            QMessageBox.critical(self, "分析失败", f"{str(e)}")
+
+    def _on_batch_retrain(self):
+        try:
+            min_samples = int(self.retrain_min_samples.text())
+            epochs = int(self.retrain_epochs.text())
+        except ValueError:
+            QMessageBox.warning(self, "参数错误", "样本数和 Epoch 必须是整数。")
+            return
+        reply = QMessageBox.question(
+            self, "确认重训练",
+            f"将使用反馈数据 + 批量标注数据进行全量重训练。\n"
+            f"最少样本：{min_samples} | Epoch：{epochs}\n\n"
+            f"训练过程可能需要较长时间，是否继续？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.batch_retrain_info.setText("⏳ 训练中...")
+        self._batch_retrain_thread = BatchRetrainThread(min_samples, epochs)
+        self._batch_retrain_thread.finished_signal.connect(self._on_batch_retrain_finished)
+        self._batch_retrain_thread.start()
+
+    def _on_batch_retrain_finished(self, model_path, message):
+        self.batch_retrain_info.setText(message)
+        if model_path and os.path.exists(model_path):
+            reply = QMessageBox.question(
+                self, "训练完成",
+                f"{message}\n\n是否立即切换到新模型？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                reload_bert_model(model_path)
+                QMessageBox.information(self, "模型切换", "已切换到新训练的模型！")
+        else:
+            QMessageBox.information(self, "训练结果", message)
+        self._on_batch_refresh_status()
+
+    def _on_batch_export(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出标注数据", "annotated_data.csv", "CSV 文件 (*.csv)"
+        )
+        if not file_path:
+            return
+        try:
+            path = export_annotated_data(file_path)
+            self.batch_export_info.setText(f"已导出：{os.path.basename(path)}")
+            QMessageBox.information(self, "导出成功", f"已导出到：\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"{str(e)}")
+
 
 # ================= 6. 启动 =================
 if __name__ == "__main__":
